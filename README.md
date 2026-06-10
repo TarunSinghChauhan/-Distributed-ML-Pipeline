@@ -76,4 +76,4 @@ A production-grade, distributed data engineering pipeline designed to collect, v
 - **Local MinIO S3A**: Optimized Hadoop configuration for sub-second S3 access.
 
 ---
-*Created by [Your Name] for Senior Data Engineer Portfolio.*
+*Created by Tarun.*
