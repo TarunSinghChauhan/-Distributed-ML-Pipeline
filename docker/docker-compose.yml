@@ -1,0 +1,190 @@
+version: '3.8'
+
+services:
+  # --- PostgreSQL for Airflow Metadata ---
+  postgres:
+    image: postgres:13
+    container_name: ml_pipeline_db
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # --- Redis for Airflow Caching/Celery (though using LocalExecutor) ---
+  redis:
+    image: redis:6-alpine
+    container_name: ml_pipeline_redis
+    ports:
+      - "6379:6379"
+
+  # --- MinIO (S3 Compatible Storage) ---
+  minio:
+    image: minio/minio:latest
+    container_name: ml_pipeline_minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password123
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # --- MinIO Provisioning ---
+  minio-init:
+    image: minio/mc
+    container_name: ml_pipeline_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set local http://minio:9000 admin password123;
+      /usr/bin/mc mb local/landing-zone;
+      /usr/bin/mc mb local/processed-data;
+      /usr/bin/mc mb local/versioned-datasets;
+      /usr/bin/mc policy set public local/landing-zone;
+      /usr/bin/mc policy set public local/processed-data;
+      /usr/bin/mc policy set public local/versioned-datasets;
+      exit 0;
+      "
+
+  # --- Apache Spark Master ---
+  spark-master:
+    image: bitnami/spark:3.4
+    container_name: ml_pipeline_spark_master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+
+  # --- Apache Spark Workers ---
+  spark-worker-1:
+    image: bitnami/spark:3.4
+    container_name: ml_pipeline_spark_worker_1
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=8G
+      - SPARK_WORKER_CORES=4
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+
+  spark-worker-2:
+    image: bitnami/spark:3.4
+    container_name: ml_pipeline_spark_worker_2
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=8G
+      - SPARK_WORKER_CORES=4
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+
+  # --- Apache Airflow ---
+  airflow-webserver:
+    image: apache/airflow:2.7.1-python3.9
+    container_name: ml_pipeline_airflow_webserver
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__CORE__FERNET_KEY=
+      - AIRFLOW__WEBSERVER__SECRET_KEY=secret_key
+      - _PIP_ADDITIONAL_DEPENDENCIES=apache-airflow-providers-apache-spark==4.1.2 fsspec s3fs pyspark==3.4.1
+    volumes:
+      - ../airflow/dags:/opt/airflow/dags
+      - ../airflow/plugins:/opt/airflow/plugins
+      - ../spark_jobs:/opt/airflow/spark_jobs
+    ports:
+      - "8081:8080"
+    command: webserver
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  airflow-scheduler:
+    image: apache/airflow:2.7.1-python3.9
+    container_name: ml_pipeline_airflow_scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - _PIP_ADDITIONAL_DEPENDENCIES=apache-airflow-providers-apache-spark==4.1.2 fsspec s3fs pyspark==3.4.1
+    volumes:
+      - ../airflow/dags:/opt/airflow/dags
+      - ../airflow/plugins:/opt/airflow/plugins
+      - ../spark_jobs:/opt/airflow/spark_jobs
+    command: scheduler
+
+  airflow-init:
+    image: apache/airflow:2.7.1-python3.9
+    container_name: ml_pipeline_airflow_init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
+    command: >
+      bash -c "airflow db init &&
+      airflow users create --username admin --firstname admin --lastname admin --role Admin --email admin@example.com --password admin &&
+      airflow connections add 'spark_default' --conn-type 'spark' --conn-host 'spark://spark-master' --conn-port '7077' &&
+      airflow connections add 'aws_default' --conn-type 'aws' --conn-extra '{\"aws_access_key_id\": \"admin\", \"aws_secret_access_key\": \"password123\", \"host\": \"http://minio:9000\"}'"
+
+  # --- Jupyter Notebook ---
+  jupyter:
+    image: jupyter/pyspark-notebook:spark-3.4.1
+    container_name: ml_pipeline_jupyter
+    ports:
+      - "8888:8888"
+    environment:
+      - JUPYTER_TOKEN=admin
+    volumes:
+      - ..:/home/jovyan/work
+
+  # --- Streamlit Dashboard ---
+  streamlit:
+    build:
+      context: ../streamlit
+      dockerfile: Dockerfile
+    container_name: ml_pipeline_streamlit
+    ports:
+      - "8501:8501"
+    environment:
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=admin
+      - MINIO_SECRET_KEY=password123
+    depends_on:
+      - minio
+
+networks:
+  default:
+    name: ml_pipeline_network
